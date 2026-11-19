@@ -1,49 +1,46 @@
-"""gta6-trophy-rarity-forecast-01 entry: damped local drift + earned-count
-decomposition, with hierarchical shrinkage.
+"""GTA VI trophy rarity forecast (gta6-trophy-rarity-forecast-01).
 
-Model
------
-An Exophase earn rate is a ratio: rate_i(t) = earned_i(t) / players(t). Both
-parts grow through launch week, and the rate's move is their difference.
+Forecasts each GTA VI PS5 trophy's Exophase earn rate at the case target,
+as five quantiles per trophy, scored by pinball loss on the logit scale.
 
-Earn-rate curves saturate (a trophy's rate rises toward the share of players
-who ever earn it), so a straight trend line extrapolated 4.5 days past a
-2.5-day history overshoots badly -- worst for common trophies already near
-their ceiling. Instead we estimate each trophy's CURRENT drift (logit per
-hour) from its most recent distinct page states and extrapolate it with a
-damping factor that decays with horizon: the total forecast move is bounded
-by drift * TAU_DAMP, so the forecast approaches an asymptote instead of
-running away on a line:
+Why this shape
+---------------
+An earn rate is a ratio, earned / players, and both halves move through
+launch week. A trophy's rate climbs toward the share of players who ever
+earn it, so its logit drifts roughly linearly for a while and then bends
+flat -- a straight line extrapolated 4.5 days past a 2.5-day history runs
+away, worst for common trophies already near their ceiling. The fix used
+here is to measure only the *current* drift and let its effect saturate
+with horizon:
 
     logit(r_target) = logit(r_last) + drift * H * TAU / (TAU + H)
 
-where H is the horizon in hours and TAU = 36 h.
+with H the horizon in hours and TAU = 36 h, so the total move is bounded
+by drift * TAU no matter how far the target sits.
 
-The same damped drift is applied to ln(earned) and ln(players) separately
-and the ratio taken (earned-count decomposition: keeps earned counts monotone,
-enforces earned <= players, handles the 100% trophy naturally). The two
-medians are averaged on the logit scale.
+The same damped drift is run on ln(earned) and ln(players) separately and
+the ratio taken: earned counts stay monotone, earned <= players is enforced
+by construction, and the 100% trophy behaves. The two medians (ratio form
+and direct logit form) are averaged 50/50 on the logit scale.
 
-Because Exophase refreshes on its own schedule, consecutive reads often repeat
-the same page. Only distinct page states carry trend information, so the fits
-use distinct states stamped at their first appearance (the best estimate of
-each refresh time).
+Exophase refreshes on its own clock, so consecutive reads often repeat the
+same page verbatim. Only distinct page states carry trend information, so
+every fit uses distinct states stamped at their first appearance -- the
+best available estimate of each refresh time -- and only the most recent
+36 hours of them.
 
 Per-trophy drifts are noisy (rates print to 2 decimals; refreshes jump), so
-each trophy's drift is shrunk toward its tier's mean drift and the global mean
-drift, with the shrinkage weight set by the fit's effective sample size.
+each trophy's drift is pulled toward its tier's mean drift and the global
+mean drift, the pull weighted by the fit's effective sample size.
 
-Spreads (pinball loss rewards honest quantiles):
-  * base random-walk term, 0.55 logit units per sqrt-day of horizon;
-  * per-trophy residual volatility from the logit fit, scaled by how far the
-    target extrapolates past the history;
-  * a staleness term: when the last distinct page state is old, a refresh
-    jump is pending, so the spread widens with the stale time.
-  * when the whole history is one frozen page (the practice cases), the median
-    is shifted down 0.35 logit (a refresh is overdue on launch night and new
-    players dilute every rate) and the spread is widened.
+Spreads (pinball loss rewards honest quantiles) combine a random-walk base
+term, each trophy's own residual volatility scaled by how far the target
+extrapolates past the history, and a staleness term: when the last distinct
+state is old, a refresh jump is pending. When the whole history is a single
+frozen page the median is shifted down (new players dilute every rate at
+the overdue refresh) and the spread widened.
 
-Everything is deterministic closed-form least squares; standard library only.
+Deterministic closed-form least squares; standard library only; no network.
 """
 
 import json
@@ -58,262 +55,246 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+# Quantile levels, in the order each output row lists them.
+QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
+# Standard normal quantiles at those levels.
+Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
+            0.6744897501960817, 1.6448536269514722]
 
-RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
-# Spread of a rate's move, in logit units per square-root day (base term).
-# Tuned on a cohort-model backtest: 0.35 is best in-simulation, but the real
-# world has shocks the simulation cannot see (weekend player surge, refresh
-# blackouts), so 0.45 keeps a safety margin while still beating the house
-# baseline's 0.5 -- our median is better because we model the trend.
-SIGMA0 = 0.45
-# Damping timescale for the drift extrapolation, in hours: the total forecast
-# move is bounded by drift * TAU_DAMP no matter how long the horizon.
-TAU_DAMP_H = 36.0
-# Window for the local drift fit: only distinct states this recent (hours
-# before the last state) are used, at least MIN_STATES states.
-DRIFT_WINDOW_H = 36.0
-MIN_STATES = 3
-# Shrinkage strength: a trophy's own slope gets weight n_eff / (n_eff + K).
-SHRINK_K = 4.0
-# Median shift (logit) when the entire history is a single frozen page.
-FROZEN_SHIFT = 0.35
-# Extra spread (logit) when the entire history is a single frozen page.
-FROZEN_SPREAD = 0.45
-# Staleness spread: per hour the last distinct state has been unchanged.
-STALE_PER_HOUR = 0.012
-STALE_CAP = 0.35
-# Hard caps on the total spread, in logit units.
-SIGMA_MIN = 0.15
-SIGMA_MAX = 1.60
+# --- model constants (see the docstring) ---
+DAMP_TAU_HOURS = 36.0       # damping timescale for drift extrapolation
+LOCAL_WINDOW_HOURS = 36.0   # only distinct states this recent feed the drifts
+MIN_WINDOW_STATES = 3       # keep at least this many states even if older
+SHRINK_STRENGTH = 4.0       # own drift weight = n_eff / (n_eff + SHRINK_STRENGTH)
+BASE_VOL_PER_SQRT_DAY = 0.45  # random-walk spread, logit units per sqrt-day
+FROZEN_MEDIAN_SHIFT = 0.35  # logit shift down when history is one frozen page
+FROZEN_EXTRA_SPREAD = 0.45  # extra logit spread for a frozen history
+STALE_SPREAD_PER_HOUR = 0.012
+STALE_SPREAD_CAP = 0.35
+SPREAD_FLOOR = 0.15
+SPREAD_CEIL = 1.60
 
 
-def clamp_pct(x):
-    return min(99.99, max(0.01, x))
+def clamp_rate(pct):
+    """Clamp a percent into the range where a logit exists."""
+    return min(99.99, max(0.01, pct))
 
 
-def logit_pct(x):
-    p = clamp_pct(x) / 100.0
+def logit_of(pct):
+    p = clamp_rate(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit_pct(lg):
-    if lg >= 0:
-        e = math.exp(-lg)
-        return 100.0 / (1.0 + e)
+def pct_of_logit(lg):
+    if lg >= 0.0:
+        return 100.0 / (1.0 + math.exp(-lg))
     e = math.exp(lg)
     return 100.0 * e / (1.0 + e)
 
 
-def round4(x):
-    scaled = x * 10000
+def round4_js(x):
+    """Round to 4 decimals, half up, as JavaScript's Math.round does."""
+    scaled = x * 10000.0
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000
+    value = whole / 10000.0
     return int(value) if value == int(value) else value
 
 
-def parse_time(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hours_since_release(dt):
-    return (dt - RELEASE).total_seconds() / 3600.0
+def hours_after_launch(moment):
+    return (moment - LAUNCH).total_seconds() / 3600.0
 
 
-def wls(xs, ys, ws):
-    """Weighted least squares for y ~ a + b*x. Returns (a, b, resid_std, n_eff)."""
-    sw = sum(ws)
-    if sw <= 0 or len(xs) < 2:
+def slope_fit(xs, ys):
+    """Least squares for y ~ a + b*x. Returns (slope, resid_std, n_eff).
+
+    Returns None when the x values cannot pin a slope down.
+    """
+    count = len(xs)
+    if count < 2:
         return None
-    mx = sum(w * x for x, w in zip(xs, ws)) / sw
-    my = sum(w * y for y, w in zip(ys, ws)) / sw
-    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
+    mean_x = sum(xs) / count
+    mean_y = sum(ys) / count
+    sxx = sum((x - mean_x) ** 2 for x in xs)
     if sxx <= 1e-12:
         return None
-    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
-    b = sxy / sxx
-    a = my - b * mx
-    if len(xs) > 2:
-        resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-        var = sum(w * r * r for r, w in zip(resid, ws)) / sw
-        resid_std = math.sqrt(max(var, 0.0))
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    if count > 2:
+        resid_var = sum((y - (intercept + slope * x)) ** 2
+                        for x, y in zip(xs, ys)) / count
+        resid_std = math.sqrt(max(resid_var, 0.0))
     else:
         resid_std = 0.0
-    n_eff = sw * sw / sum(w * w for w in ws)
-    return a, b, resid_std, n_eff
+    # Uniform weights here, so the effective sample size is the count.
+    return slope, resid_std, float(count)
 
 
-def distinct_states(history):
-    """Collapse consecutive identical page states, stamped at first appearance.
+def collapse_reads(history):
+    """Collapse consecutive identical page states, stamped at first sight.
 
-    Returns a list of (hours_since_release, players, rates_tuple).
+    Returns a list of (hours_after_launch, players_tracked, rates) with one
+    entry per distinct page state, oldest first.
     """
-    states = []
-    prev_key = None
-    for rec in history:
-        if "h" in rec:  # backtest harness smuggles hours in
-            h = rec["h"]
-        else:
-            h = hours_since_release(parse_time(rec["at"]))
-        key = (rec["players_tracked"], tuple(rec["rates"]))
-        if key != prev_key:
-            states.append((h, rec["players_tracked"], rec["rates"]))
-            prev_key = key
-    return states
+    snapshots = []
+    previous_key = None
+    for read in history:
+        key = (read["players_tracked"], tuple(read["rates"]))
+        if key == previous_key:
+            continue
+        snapshots.append((hours_after_launch(parse_ts(read["at"])),
+                          read["players_tracked"], read["rates"]))
+        previous_key = key
+    return snapshots
+
+
+def shrink_slope(own, tier_mean, global_mean, n_eff):
+    """Pull a noisy per-trophy slope toward tier + global priors."""
+    prior = 0.5 * tier_mean + 0.5 * global_mean
+    own_weight = n_eff / (n_eff + SHRINK_STRENGTH)
+    return own_weight * own + (1.0 - own_weight) * prior
 
 
 def forecast_case(case, name):
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    if case["levels"] != QUANTILES:
+        raise ValueError(f"{name} asks for levels {case['levels']}")
     if not case["history"]:
         raise ValueError(f"{name} has no history")
 
     trophies = case["trophies"]
-    n = len(trophies)
+    horizon_hours = case["horizon_minutes"] / 60.0
     horizon_days = case["horizon_minutes"] / 1440.0
-    h_target = hours_since_release(parse_time(case["target"]))
-    x_target = math.log1p(h_target)
+    checkpoint_h = hours_after_launch(parse_ts(case["at"]))
 
-    states = distinct_states(case["history"])
-    last_h, last_players, last_rates = states[-1]
-    first_h = states[0][0]
-    span_h = max(last_h - first_h, 1.0)
-    stale_h = hours_since_release(parse_time(case["at"])) - last_h
-    frozen = len(states) == 1
-    horizon_h = case["horizon_minutes"] / 60.0
+    snaps = collapse_reads(case["history"])
+    last_t, last_players, last_rates = snaps[-1]
+    first_t = snaps[0][0]
+    history_span_h = max(last_t - first_t, 1.0)
+    stale_hours = max(checkpoint_h - last_t, 0.0)
+    frozen = len(snaps) == 1
 
-    # Local drift window: the most recent distinct states (at least MIN_STATES).
-    win = [s for s in states if s[0] >= last_h - DRIFT_WINDOW_H]
-    if len(win) < MIN_STATES:
-        win = states[-MIN_STATES:] if len(states) >= MIN_STATES else states
-    win_h = [s[0] for s in win]
-    # Damping factor for the drift extrapolation over this horizon.
-    damp = TAU_DAMP_H / (TAU_DAMP_H + horizon_h)
+    # Local window: the most recent distinct states (at least MIN_WINDOW_STATES).
+    window = [s for s in snaps if s[0] >= last_t - LOCAL_WINDOW_HOURS]
+    if len(window) < MIN_WINDOW_STATES:
+        window = snaps[-MIN_WINDOW_STATES:] if len(snaps) >= MIN_WINDOW_STATES else snaps
+    window_t = [s[0] for s in window]
 
-    def local_drift(ys):
-        """WLS slope of ys on hours over the drift window. Returns
-        (drift, resid_std, n_eff) or None if the window is degenerate."""
-        if len(win) < 2:
-            return None
-        ws = [1.0] * len(win)
-        fit = wls(win_h, ys, ws)
-        if fit is None:
-            return None
-        _, b, resid, n_eff = fit
-        return b, resid, n_eff
+    # Damping: the drift's total effect over this horizon.
+    # move = drift * horizon_hours * TAU / (TAU + horizon_hours)
+    damp_factor = DAMP_TAU_HOURS / (DAMP_TAU_HOURS + horizon_hours)
 
-    # --- players(t): damped drift of ln P ---
-    ln_p_win = [math.log(max(p, 1)) for _, p, _ in win]
-    dp = local_drift(ln_p_win)
-    if dp is not None:
-        drift_p = dp[0]
-    else:
-        drift_p = 0.0
-    # Players never shrink: clamp the drift at >= 0.
-    drift_p = max(drift_p, 0.0)
-    ln_p_target = math.log(max(last_players, 1)) + drift_p * horizon_h * damp
-    p_target = max(math.exp(ln_p_target), last_players)
+    # --- players(t): damped drift of ln(players), never shrinking ---
+    players_fit = slope_fit(window_t,
+                            [math.log(max(s[1], 1)) for s in window])
+    players_drift = max(players_fit[0], 0.0) if players_fit else 0.0
+    players_target = max(
+        math.exp(math.log(max(last_players, 1))
+                 + players_drift * horizon_hours * damp_factor),
+        float(last_players))
 
-    # --- per-trophy drifts ---
-    tier_of = [t["tier"] for t in trophies]
-    drifts_e, drifts_l = [], []
-    for i in range(n):
-        # Earned counts (+0.5 smoothing) and logit rates over the window.
-        ln_e = [math.log(max((r[i] if r[i] is not None else 0.0) / 100.0 * p, 0.0) + 0.5)
-                for _, p, r in win]
-        lg_r = [logit_pct(r[i] if r[i] is not None else 0.0) for _, _, r in win]
-        drifts_e.append(local_drift(ln_e))
-        drifts_l.append(local_drift(lg_r))
+    # --- per-trophy fits on the window ---
+    # For each trophy: slope of ln(earned) and of logit(rate), with residuals.
+    earned_fits, rate_fits = [], []
+    for idx in range(len(trophies)):
+        ln_earned, logit_rates = [], []
+        for _t, players, rates in window:
+            rate = rates[idx]
+            rate = 0.0 if rate is None else rate
+            earned = rate / 100.0 * players
+            ln_earned.append(math.log(max(earned, 0.0) + 0.5))
+            logit_rates.append(logit_of(rate))
+        earned_fits.append(slope_fit(window_t, ln_earned))
+        rate_fits.append(slope_fit(window_t, logit_rates))
 
-    def mean_drift(drifts, idxs):
-        vals = [d[0] for j, d in enumerate(drifts) if d is not None and j in idxs]
-        if not vals:
-            return 0.0
-        return sum(vals) / len(vals)
+    def average_slope(fits, indices):
+        slopes = [f[0] for j, f in enumerate(fits)
+                  if f is not None and j in indices]
+        return sum(slopes) / len(slopes) if slopes else 0.0
 
-    all_idx = set(range(n))
-    global_de = mean_drift(drifts_e, all_idx)
-    global_dl = mean_drift(drifts_l, all_idx)
-    tier_de, tier_dl = {}, {}
-    for tier in set(tier_of):
-        idxs = {j for j, t in enumerate(tier_of) if t == tier}
-        tier_de[tier] = mean_drift(drifts_e, idxs)
-        tier_dl[tier] = mean_drift(drifts_l, idxs)
+    all_idx = set(range(len(trophies)))
+    global_earned = average_slope(earned_fits, all_idx)
+    global_rate = average_slope(rate_fits, all_idx)
+    tier_earned, tier_rate = {}, {}
+    for tier in sorted({t["tier"] for t in trophies}):
+        members = {j for j, t in enumerate(trophies) if t["tier"] == tier}
+        tier_earned[tier] = average_slope(earned_fits, members)
+        tier_rate[tier] = average_slope(rate_fits, members)
 
-    # Staleness spread (a refresh jump is pending when the page is stale).
-    stale_sigma = min(STALE_PER_HOUR * max(stale_h, 0.0), STALE_CAP)
-    base_sigma = SIGMA0 * math.sqrt(horizon_days)
+    # --- spread scaffolding, shared by every trophy ---
+    base_spread = BASE_VOL_PER_SQRT_DAY * math.sqrt(horizon_days)
     if frozen:
-        base_sigma = math.sqrt(base_sigma * base_sigma + FROZEN_SPREAD * FROZEN_SPREAD)
-    # Extrapolation factor: how far past the history the target sits.
-    extrap = math.sqrt(max(horizon_days / max(span_h / 24.0, 0.25), 1.0))
+        base_spread = math.sqrt(base_spread ** 2 + FROZEN_EXTRA_SPREAD ** 2)
+    stale_spread = min(STALE_SPREAD_PER_HOUR * stale_hours, STALE_SPREAD_CAP)
+    # How far the target extrapolates past the history, in days.
+    extrap = math.sqrt(max(horizon_days / max(history_span_h / 24.0, 0.25), 1.0))
 
     rows = []
-    for i, trophy in enumerate(trophies):
-        last_r = last_rates[i]
-        last_r = 0.0 if last_r is None else last_r
+    for idx, trophy in enumerate(trophies):
+        last_rate = last_rates[idx]
+        last_rate = 0.0 if last_rate is None else last_rate
+        last_logit = logit_of(last_rate)
 
-        lg_last = logit_pct(last_r)
-
-        # --- earned-count forecast: damped drift of ln E, divided by P(t) ---
-        de = drifts_e[i]
-        if de is not None:
-            drift_e, _, n_eff = de
-            prior = 0.5 * tier_de[tier_of[i]] + 0.5 * global_de
-            w_own = n_eff / (n_eff + SHRINK_K)
-            drift_e = w_own * drift_e + (1.0 - w_own) * prior
-            drift_e = max(drift_e, 0.0)  # earned counts never shrink
-            ln_e_last = math.log(max(last_r / 100.0 * last_players, 0.0) + 0.5)
-            e_target = math.exp(ln_e_last + drift_e * horizon_h * damp) - 0.5
-            e_target = max(e_target, 0.0)
-            r_earned = 100.0 * min(e_target, p_target) / p_target
+        # --- ratio forecast: ln(earned) drift over ln(players) drift ---
+        fit_e = earned_fits[idx]
+        if fit_e is not None:
+            slope_e, _resid_e, n_eff = fit_e
+            slope_e = shrink_slope(slope_e, tier_earned[trophy["tier"]],
+                                   global_earned, n_eff)
+            slope_e = max(slope_e, 0.0)  # earned counts never shrink
+            earned_last = math.log(max(last_rate / 100.0 * last_players, 0.0) + 0.5)
+            earned_target = math.exp(earned_last
+                                     + slope_e * horizon_hours * damp_factor) - 0.5
+            earned_target = max(earned_target, 0.0)
+            ratio_rate = 100.0 * min(earned_target, players_target) / players_target
         else:
-            r_earned = last_r
+            ratio_rate = last_rate
 
-        # --- logit-drift forecast ---
-        dl = drifts_l[i]
-        if dl is not None:
-            drift_l, resid_l, n_eff = dl
-            prior = 0.5 * tier_dl[tier_of[i]] + 0.5 * global_dl
-            w_own = n_eff / (n_eff + SHRINK_K)
-            drift_l = w_own * drift_l + (1.0 - w_own) * prior
-            lg_target = lg_last + drift_l * horizon_h * damp
-            r_logit = inv_logit_pct(lg_target)
-            resid = resid_l
+        # --- direct forecast: logit(rate) drift ---
+        fit_r = rate_fits[idx]
+        if fit_r is not None:
+            slope_r, resid_r, n_eff = fit_r
+            slope_r = shrink_slope(slope_r, tier_rate[trophy["tier"]],
+                                   global_rate, n_eff)
+            direct_rate = pct_of_logit(last_logit
+                                       + slope_r * horizon_hours * damp_factor)
+            resid = resid_r
         else:
-            r_logit = last_r
+            direct_rate = last_rate
             resid = 0.0
 
-        # Ensemble on the logit scale.
-        lg_med = 0.5 * (logit_pct(r_earned) + logit_pct(r_logit))
+        # Ensemble on the logit scale; frozen history shifts the median down.
+        median_logit = 0.5 * (logit_of(ratio_rate) + logit_of(direct_rate))
         if frozen:
-            lg_med -= FROZEN_SHIFT
-        median = inv_logit_pct(lg_med)
+            median_logit -= FROZEN_MEDIAN_SHIFT
+        median = pct_of_logit(median_logit)
 
-        # The 100% trophy stays (nearly) 100%.
-        if last_r >= 99.9:
+        # A trophy already at 100% stays (nearly) there.
+        if last_rate >= 99.9:
             median = 99.95
-            sigma = 0.10
+            spread = 0.10
         else:
-            sigma = math.sqrt(base_sigma * base_sigma
-                              + (resid * extrap) ** 2
-                              + stale_sigma * stale_sigma)
-            sigma = min(max(sigma, SIGMA_MIN), SIGMA_MAX)
+            spread = math.sqrt(base_spread ** 2
+                               + (resid * extrap) ** 2
+                               + stale_spread ** 2)
+            spread = min(max(spread, SPREAD_FLOOR), SPREAD_CEIL)
 
-        lg_m = logit_pct(median)
-        qs = []
-        for z in Z:
-            q = inv_logit_pct(lg_m + z * sigma)
-            qs.append(round4(min(100.0, max(0.0, q))))
-        # Keep quantiles non-decreasing after rounding.
-        for k in range(1, 5):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
-        rows.append({"id": trophy["id"], "q": qs})
+        median_logit = logit_of(median)
+        quantiles = []
+        for z in Z_SCORES:
+            q = pct_of_logit(median_logit + z * spread)
+            quantiles.append(round4_js(min(100.0, max(0.0, q))))
+        for k in range(1, 5):  # rounding must not break monotonicity
+            if quantiles[k] < quantiles[k - 1]:
+                quantiles[k] = quantiles[k - 1]
+        rows.append({"id": trophy["id"], "q": quantiles})
 
     return {"trophies": rows}
 
